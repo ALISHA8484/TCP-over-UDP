@@ -1,99 +1,105 @@
-import threading
+﻿import threading
 import socket # For UDP socket operation
 import time
 import random
+import struct
 import Packet
 import queue # For accept queue
 from Packet import Packet, log_event , MSS 
 
 # --- Connection Class ---
 class Connection:
-    """
-    Represents an active TCP-like connection.
-    Manages send/receive buffers, sequence numbers, acknowledgments,
-    sliding windows, and connection state.
-    """
     def __init__(self, udp_socket, remote_addr, is_server=False):
-
         self.udp_socket = udp_socket
-        self.remote_addr = remote_addr # (ip, port) of the remote peer
+        self.remote_addr = remote_addr
         self.is_server = is_server
 
-        self.state = "CLOSED" # Initial state: CLOSED, LISTEN, SYN_SENT, SYN_RCVD, ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, LAST_ACK, TIME_WAIT
+        self.state = "CLOSED"
         
-        # Sequence and Acknowledgment numbers
-        self.my_seq_num = random.randint(0, 2**32 - 1)
-        self.peer_seq_num = 0
+        self.initial_seq_num = random.randint(0, 2**32 - 1)
+        self.my_seq_num = self.initial_seq_num
+        self.last_acked_seq = self.initial_seq_num
+
+        self.peer_initial_seq_num = 0
         self.peer_ack_num = 0
         self.next_expected_seq = 0
+
+        self.send_buffer = b""
+        self.receive_buffer = b""
         
-        # Buffers
-        self.send_buffer = b"" # Data waiting to be sent
-        self.receive_buffer = b"" # Data received but not yet read by application
-        
-        # Sliding Window parameters
         self.send_window_size = 128
-        self.receive_window_size = 128
-        self.last_acked_seq = self.my_seq_num # The sequence number of the last byte acknowledged by the peer
-        self.send_unacked_packets = {} # Dictionary to store packets sent but not yet ACKed: {seq_num: (packet, timestamp)}
+        self.receive_window_size = 128 # This can be dynamic based on receive_buffer free space
         
-        # Flow Control and Congestion Control variables (for scoring items)
-        self.rwnd = self.receive_window_size # Receive Window - based on peer's available buffer space 
-        self.cwnd = MSS # Congestion Window - initially MSS
+        self.send_unacked_packets = {} 
+        
+        self.rwnd = self.receive_window_size 
+        self.cwnd = MSS 
         self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
         
-        # Fast Retransmit specific variables
-        self.duplicate_acks = 0 # Counter for duplicate ACKs 
-        self.retransmit_seq_on_dup_ack = None # Sequence number to retransmit on 3rd dup ACK
+        self.duplicate_acks = 0
+        self.retransmit_seq_on_dup_ack = None
 
-        # Timers (for scoring items)
-        self.retransmission_timer = None
-        self.retransmission_timeout = 1.0
+        self.retransmission_timeout = 1.0 
+        self.retransmission_timer = None 
         self.keep_alive_timer = None
-        self.connection_timeout = 60 # Seconds until connection auto-closes if idle
+        self.connection_timeout = 60
 
-        # Threads for sending/receiving logic
+        # --- NEW for cleaner receive logic ---
+        self.incoming_packet_queue = queue.Queue() # Queue for packets received by TCPSocket._listen_loop for THIS connection
+        # --- END NEW ---
+
         self.send_thread = threading.Thread(target=self._send_loop)
-        self.receive_thread = threading.Thread(target=self._receive_loop) # This thread processes already received data for this connection
+        self.receive_thread = threading.Thread(target=self._receive_loop) 
         self._running = False
 
     def _start_connection_threads(self):
-        """Starts the background threads for sending and receiving logic."""
         if not self._running:
             self._running = True
-            self.send_thread.daemon = True # Daemon threads exit when the main program exits
+            self.send_thread.daemon = True
             self.receive_thread.daemon = True
             self.send_thread.start()
             self.receive_thread.start()
             log_event(f"Connection threads started for {self.remote_addr}")
 
     def _stop_connection_threads(self):
-        """Stops the background threads."""
         if self._running:
             self._running = False
-            # Implement graceful shutdown for threads if needed
             log_event(f"Connection threads stopped for {self.remote_addr}")
+            # Clear the queue to prevent hanging if there are unprocessed packets
+            while not self.incoming_packet_queue.empty():
+                try:
+                    self.incoming_packet_queue.get_nowait()
+                except queue.Empty:
+                    break
+
 
     def _send_loop(self):
-        """
-        Background thread for managing the send buffer and transmitting packets.
-        Handles retransmissions, sliding window updates.
-        """
         while self._running:
-            # Check if there's data in the send buffer and space in the window
-            if self.send_buffer and len(self.send_buffer) > (self.my_seq_num - self.last_acked_seq) and (self.my_seq_num - self.last_acked_seq) < self.effective_send_window:
+            bytes_in_flight = self.my_seq_num - self.last_acked_seq
+            
+            # --- DEBUG LOG ---
+            log_event(f"DEBUG_SEND_LOOP: MySeq={self.my_seq_num}, LastAckedSeq={self.last_acked_seq}, "
+                      f"BytesInFlight={bytes_in_flight}, SendBufferLen={len(self.send_buffer)}, "
+                      f"EffectiveWindow={self.effective_send_window}")
+            # --- END DEBUG LOG ---
 
-                data_to_send = self.send_buffer[self.my_seq_num - self.last_acked_seq : self.my_seq_num - self.last_acked_seq + MSS]
-                
-                # Create and send packet
+            available_window_space = self.effective_send_window - bytes_in_flight
+            
+            send_size = min(len(self.send_buffer), available_window_space, MSS)
+            
+            if send_size > 0:
+                data_to_send = self.send_buffer[:send_size] 
+
                 packet = Packet(self.udp_socket.getsockname()[1], self.remote_addr[1], 
-                                self.my_seq_num, self.next_expected_seq, Packet.ACK,
+                                self.my_seq_num, self.next_expected_seq, Packet.ACK, # Always include ACK flag for data packets
                                 self.receive_window_size, data_to_send)
                 try:
                     self.udp_socket.sendto(packet.to_bytes(), self.remote_addr)
-                    log_event(f"Sent data packet to {self.remote_addr}: Seq={packet.seq_num}, Len={len(data_to_send)}")
-                    self.send_unacked_packets[packet.seq_num] = (packet, time.time()) # Store for retransmission
-                    self.my_seq_num += len(data_to_send) # Advance my sequence number
+                    log_event(f"Sent data packet to {self.remote_addr}: Seq={packet.seq_num}, Len={len(data_to_send)}, Bytes in flight: {bytes_in_flight + len(data_to_send)}")
+                    
+                    self.send_unacked_packets[packet.seq_num] = (packet, time.time())
+                    self.my_seq_num += len(data_to_send) 
+
                 except Exception as e:
                     log_event(f"Error sending data packet: {e}")
 
@@ -104,201 +110,211 @@ class Connection:
                     log_event(f"Retransmitting packet {packet.seq_num} to {self.remote_addr} due to timeout.")
                     try:
                         self.udp_socket.sendto(packet.to_bytes(), self.remote_addr)
-                        self.send_unacked_packets[seq] = (packet, current_time) # Update send time
-                        # Congestion control: Timeout leads to cwnd = MSS
-                        self.cwnd = MSS 
+                        # Do NOT update timestamp here for retransmission, or update only if you implement RTT estimation
+                        # For a simple RTO, keep original timestamp or use a separate retransmit counter
+                        # self.send_unacked_packets[seq] = (packet, current_time) # Optional: update timestamp for next retransmission
+                        
+                        self.cwnd = MSS
+                        log_event(f"CWND reset to {self.cwnd} due to timeout.")
                         self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
-                    except Exception as e:
-                        log_event(f"Error retransmitting packet: {e}") # [cite: 1]
+                        self.duplicate_acks = 0
+                        self.retransmit_seq_on_dup_ack = None
 
-            time.sleep(0.01) # Small delay to prevent busy-waiting
+                    except Exception as e:
+                        log_event(f"Error retransmitting packet: {e}")
+
+            time.sleep(0.01)
 
     def _receive_loop(self):
         """
-        Background thread for processing received packets for this specific connection.
-        Handles acknowledgments, out-of-order packets, and updates receive window.
-        Note: The actual UDP reception (sock.recvfrom) is done by the Socket's main receive thread.
-        This loop processes data *after* it has been demultiplexed to this connection.
+        Background thread for processing packets from the incoming_packet_queue.
+        These packets are already received by TCPSocket._listen_loop and demultiplexed.
         """
         while self._running:
-            # This loop would typically process a queue of received packets specific to this connection
-            # that were put there by the main Socket's receive thread.
-            # For simplicity, let's assume raw packets are passed directly for now.
-            # In a full implementation, you'd have a queue like `self.incoming_packet_queue`.
-
-            # This part needs careful design: where do packets for *this specific connection* arrive?
-            # They should be put into a connection-specific queue by the main socket's listener thread.
-
-            # Placeholder for processing logic (this will be complex)
-            # When a packet is received for this connection:
-            # 1. Check sequence number and flags.
-            # 2. If it's an ACK: update self.last_acked_seq, remove from self.send_unacked_packets,
-            #    and update send window, cwnd (for congestion control). [cite: 79, 80, 81]
-            # 3. If it's data: add to receive buffer, handle out-of-order, send ACK. [cite: 62, 85, 88]
-            # 4. If it's FIN: initiate connection close.
-            # 5. If it's RST: immediate connection reset.
-            pass # Implement packet processing logic here
+            try:
+                # Get packet from queue (blocking with a timeout)
+                packet = self.incoming_packet_queue.get(timeout=0.1) 
+                self.handle_incoming_packet(packet) # Process the packet
+            except queue.Empty:
+                pass # No packet in queue, continue loop
+            except Exception as e:
+                log_event(f"[RECEIVE_LOOP_ERROR] Error processing packet from queue: {e}") 
+            # No sleep here, as queue.get(timeout) provides the necessary delay
 
     def handle_incoming_packet(self, packet):
-        """
-        Called by the Socket's main receive thread when a packet
-        is identified for this connection.
-        """
         log_event(f"Received packet for {self.remote_addr}: {packet}")
 
+        if packet.is_rst():
+            log_event(f"Received RST from {self.remote_addr}. Connection reset.")
+            self.state = "CLOSED"
+            self._stop_connection_threads()
+            return
+
+        # --- Process ACK segment ---
         if packet.is_ack():
-            # Check if this ACK acknowledges new data
             if packet.ack_num > self.last_acked_seq:
-                # ... (Existing logic for new ACK, updating last_acked_seq, removing from unacked_packets, increasing cwnd)
-                # Reset duplicate ACK counter on new ACK
+                log_event(f"ACK received for Seq up to {packet.ack_num}. Moving send window.")
+                
+                newly_acked_bytes = packet.ack_num - self.last_acked_seq
+                
+                if newly_acked_bytes > 0:
+                    self.send_buffer = self.send_buffer[newly_acked_bytes:]
+                    log_event(f"Removed {newly_acked_bytes} bytes from send_buffer. Remaining: {len(self.send_buffer)}")
+
+                self.last_acked_seq = packet.ack_num 
+                
+                keys_to_remove = []
+                for seq_num, (sent_packet, send_time) in list(self.send_unacked_packets.items()):
+                    if (sent_packet.seq_num + sent_packet.payload_length) <= packet.ack_num: 
+                        keys_to_remove.append(seq_num)
+                for key in keys_to_remove:
+                    del self.send_unacked_packets[key]
+                
+                self.cwnd += MSS 
+                log_event(f"CWND increased to {self.cwnd} due to new ACK.")
+                self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
+
                 self.duplicate_acks = 0
                 self.retransmit_seq_on_dup_ack = None
 
-            else: # packet.ack_num <= self.last_acked_seq
-                # This is a duplicate ACK (for scoring item 11) 
+            else: # packet.ack_num <= self.last_acked_seq (duplicate ACK logic)
                 log_event(f"Received duplicate ACK for Seq {packet.ack_num}. Current last_acked_seq: {self.last_acked_seq}")
                 self.duplicate_acks += 1
-
-                # Set the sequence number to retransmit if it's the first duplicate ACK for this segment
+                
                 if self.duplicate_acks == 1:
-                    # Find the smallest (oldest) unacknowledged sequence number
-                    if self.send_unacked_packets: # Ensure there are unacked packets
+                    if self.send_unacked_packets:
                         self.retransmit_seq_on_dup_ack = min(self.send_unacked_packets.keys())
                     log_event(f"First duplicate ACK. Target for Fast Retransmit: {self.retransmit_seq_on_dup_ack}")
 
-                # Fast Retransmit: if 3 duplicate ACKs are received 
                 if self.duplicate_acks >= 3:
                     if self.retransmit_seq_on_dup_ack is not None and self.retransmit_seq_on_dup_ack in self.send_unacked_packets:
-                        log_event(f"3 Duplicate ACKs received. Performing Fast Retransmit for Seq {self.retransmit_seq_on_dup_ack}.") [cite: 1]
-
-                        # Retransmit the segment corresponding to retransmit_seq_on_dup_ack
+                        log_event(f"3 Duplicate ACKs received. Performing Fast Retransmit for Seq {self.retransmit_seq_on_dup_ack}.")
+                        
                         packet_to_retransmit, _ = self.send_unacked_packets[self.retransmit_seq_on_dup_ack]
                         try:
                             self.udp_socket.sendto(packet_to_retransmit.to_bytes(), self.remote_addr)
-                            self.send_unacked_packets[packet_to_retransmit.seq_num] = (packet_to_retransmit, time.time()) # Update send time
-
-                            # Congestion control: cwnd halved on 3 duplicate ACKs 
-                            self.cwnd = max(MSS, self.cwnd // 2) # Ensure cwnd is at least MSS
+                            # self.send_unacked_packets[packet_to_retransmit.seq_num] = (packet_to_retransmit, time.time()) # Optional: update timestamp
+                            
+                            self.cwnd = max(MSS, self.cwnd // 2) 
                             log_event(f"CWND halved to {self.cwnd} due to 3 duplicate ACKs.")
-                            self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd) [cite: 1]
-
-                            # Reset duplicate ACKs after retransmission (important)
+                            self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
+                            
                             self.duplicate_acks = 0
                             self.retransmit_seq_on_dup_ack = None
-
+                            
                         except Exception as e:
                             log_event(f"Error during Fast Retransmit: {e}")
                     else:
                         log_event("Fast Retransmit triggered but target packet not found or already retransmitted/acked.")
-    
+
+            self.rwnd = packet.window_size
+            self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
+
+        # --- Process Data Payload ---
         if packet.payload_length > 0:
-            # Acknowledge the received data payload
-            # This part needs robust out-of-order handling and receive buffer management.
-            # For now, we assume in-order delivery for simplicity in this snippet.
+            log_event(f"DEBUG_HANDLE_DATA: Processing data packet. Seq={packet.seq_num}, Expected={self.next_expected_seq}, PayloadLen={packet.payload_length}")
             
-            # Check if this is the next expected sequence number
+            # This is where sophisticated out-of-order buffering would go.
+            # For now, append only if in-order.
             if packet.seq_num == self.next_expected_seq:
                 self.receive_buffer += packet.payload
-                self.next_expected_seq += packet.payload_length # Advance expected sequence number
+                self.next_expected_seq += packet.payload_length 
                 log_event(f"Received in-order data. New next_expected_seq: {self.next_expected_seq}")
                 
-                # Send ACK for received data
                 ack_packet = Packet(self.udp_socket.getsockname()[1], self.remote_addr[1],
                                     self.my_seq_num, self.next_expected_seq, Packet.ACK,
-                                    len(self.receive_buffer)) # Send current receive window size
+                                    self.receive_window_size) 
                 try:
                     self.udp_socket.sendto(ack_packet.to_bytes(), self.remote_addr)
                     log_event(f"Sent ACK for data to {self.remote_addr}: Ack={ack_packet.ack_num}, Window={ack_packet.window_size}")
                 except Exception as e:
                     log_event(f"Error sending ACK for data: {e}")
 
-            else: # packet.seq_num != self.next_expected_seq (out-of-order)
+            else: 
                 log_event(f"Received out-of-order packet: Expected Seq {self.next_expected_seq}, got {packet.seq_num}.")
-                # Store out-of-order packets and send duplicate ACK for the last in-order byte.
-                # This part requires a more sophisticated receive buffer for reordering.
-                # For now, we just log it and send a duplicate ACK for the current next_expected_seq.
-
-                # Send a duplicate ACK for the last correctly received byte
+                
                 ack_packet = Packet(self.udp_socket.getsockname()[1], self.remote_addr[1],
                                     self.my_seq_num, self.next_expected_seq, Packet.ACK,
-                                    len(self.receive_buffer)) # Send current receive window size
+                                    self.receive_window_size) 
                 try:
                     self.udp_socket.sendto(ack_packet.to_bytes(), self.remote_addr)
                     log_event(f"Sent Duplicate ACK for out-of-order packet. Ack={ack_packet.ack_num}, Window={ack_packet.window_size}")
                 except Exception as e:
                     log_event(f"Error sending Duplicate ACK: {e}")
 
-        # Handle FIN flag
+        # --- Handle FIN flag ---
         if packet.is_fin():
             log_event(f"Received FIN from {self.remote_addr}. Initiating close process.")
-            self.state = "CLOSE_WAIT" # Or FIN_WAIT_2 depending on where you are in the 4-way handshake
-            # Send ACK for FIN
-            ack_fin_packet = Packet(self.udp_socket.getsockname()[1], self.remote_addr[1],
-                                    self.my_seq_num, packet.seq_num + 1, Packet.ACK | Packet.FIN, # ACK for FIN, and send our own FIN
-                                    self.receive_window_size)
-            try:
-                self.udp_socket.sendto(ack_fin_packet.to_bytes(), self.remote_addr)
-                log_event(f"Sent ACK+FIN to {self.remote_addr} in response to FIN.")
-            except Exception as e:
-                log_event(f"Error sending ACK+FIN: {e}")
-            self._stop_connection_threads() # Stop threads for this connection
+            if self.state == "ESTABLISHED": 
+                self.state = "CLOSE_WAIT" 
+                ack_for_fin_packet = Packet(self.udp_socket.getsockname()[1], self.remote_addr[1],
+                                            self.my_seq_num, packet.seq_num + 1, Packet.ACK,
+                                            self.receive_window_size)
+                try:
+                    self.udp_socket.sendto(ack_for_fin_packet.to_bytes(), self.remote_addr)
+                    log_event(f"Sent ACK to FIN from {self.remote_addr}.")
+                    if not self.send_buffer and not self.send_unacked_packets: 
+                        self.close() # Trigger our own FIN
+                except Exception as e:
+                    log_event(f"Error sending ACK for FIN: {e}")
+            elif self.state == "FIN_WAIT_2": 
+                log_event(f"Received FIN from {self.remote_addr} while in FIN_WAIT_2. Moving to TIME_WAIT.")
+                self.state = "TIME_WAIT"
+                final_ack_for_fin = Packet(self.udp_socket.getsockname()[1], self.remote_addr[1],
+                                            self.my_seq_num, packet.seq_num + 1, Packet.ACK,
+                                            self.receive_window_size)
+                try:
+                    self.udp_socket.sendto(final_ack_for_fin.to_bytes(), self.remote_addr)
+                    log_event(f"Sent final ACK to {self.remote_addr} for their FIN. Entering TIME_WAIT.")
+                except Exception as e:
+                    log_event(f"Error sending final ACK for FIN: {e}")
+                threading.Timer(2 * self.retransmission_timeout, self._close_after_time_wait).start()
 
-        # Handle RST flag
-        if packet.is_rst():
-            log_event(f"Received RST from {self.remote_addr}. Connection reset.")
-            self.state = "CLOSED"
-            self._stop_connection_threads()
+        if self.state == "FIN_WAIT_1" and packet.is_ack() and packet.ack_num == (self.my_seq_num): # ACK for our FIN
+            log_event(f"Received ACK for our FIN from {self.remote_addr}. Moving to FIN_WAIT_2.")
+            self.state = "FIN_WAIT_2"
 
 
     def send(self, data):
-        """
-        Adds data to the send buffer. Data is actually sent by the _send_loop thread. 
-        Blocks if the send buffer is full (though for this project, send buffer has no capacity limit).
-        """
         log_event(f"Application requested to send {len(data)} bytes to {self.remote_addr}.")
         self.send_buffer += data
-        # The send_loop will pick this up and send it
 
     def receive(self, buffer_size):
-        """
-        Retrieves data from the receive buffer. Blocks if not enough data. 
-        """
         log_event(f"Application requested to receive {buffer_size} bytes from {self.remote_addr}.")
         
         while len(self.receive_buffer) < buffer_size:
             if not self._running and len(self.receive_buffer) == 0:
                 log_event(f"Connection with {self.remote_addr} is closed and no data in buffer.")
-                return b'' # Connection closed, no more data
+                return b''
             log_event(f"Not enough data in receive buffer ({len(self.receive_buffer)}/{buffer_size} bytes). Blocking...")
-            time.sleep(0.1) # Simulate blocking
+            time.sleep(0.01) # Small sleep to prevent busy-waiting while blocking.
         
         data = self.receive_buffer[:buffer_size]
         self.receive_buffer = self.receive_buffer[buffer_size:]
+        self.receive_window_size = 128 # In a real implementation, this should reflect actual available buffer size.
         
-        # After data is read, update receive window (for scoring item 9) [cite: 62]
-        self.receive_window_size = 128 # Re-adjust based on actual buffer space
-        # A more complex implementation would calculate actual available space in the receive buffer
-        
-        log_event(f"Application received {len(data)} bytes from {self.remote_addr}.") # [cite: 1]
+        log_event(f"Application received {len(data)} bytes from {self.remote_addr}.")
         return data
 
     def close(self):
-        """
-        Initiates the connection termination process (FIN handshake).
-        """
-        log_event(f"Initiating connection close for {self.remote_addr}.") # [cite: 1]
-        if self.state == "ESTABLISHED":
-            self.state = "FIN_WAIT_1"
-            fin_packet = Packet(self.udp_socket.getsockname()[1], self.remote_addr[1],
-                                self.my_seq_num, self.next_expected_seq, Packet.FIN,
-                                self.receive_window_size)
-            try:
-                self.udp_socket.sendto(fin_packet.to_bytes(), self.remote_addr)
-                log_event(f"Sent FIN to {self.remote_addr}.")
-                # Start a timer for FIN_WAIT_1 ACK
-                # If ACK not received, retransmit FIN
-            except Exception as e:
-                log_event(f"Error sending FIN: {e}")
-        
-        self._stop_connection_threads() # Stop threads, but keep the object until fully closed from TCP perspective
+        log_event(f"Initiating connection close for {self.remote_addr}.")
+        if self.state == "ESTABLISHED" or self.state == "CLOSE_WAIT": # Can close from ESTABLISHED or after receiving FIN
+            if self.state == "ESTABLISHED": # Only send FIN if we are still ESTABLISHED
+                self.state = "FIN_WAIT_1"
+                # FIN consumes 1 sequence number
+                fin_packet = Packet(self.udp_socket.getsockname()[1], self.remote_addr[1],
+                                    self.my_seq_num, self.next_expected_seq, Packet.FIN,
+                                    self.receive_window_size)
+                try:
+                    self.udp_socket.sendto(fin_packet.to_bytes(), self.remote_addr)
+                    log_event(f"Sent FIN to {self.remote_addr}. Seq={fin_packet.seq_num}")
+                    self.my_seq_num += 1 # FIN consumes 1 byte of sequence space
+                except Exception as e:
+                    log_event(f"Error sending FIN: {e}")
+            # Do NOT stop connection threads here. They should run until TIME_WAIT or RST.
 
+
+    def _close_after_time_wait(self):
+        log_event(f"Exiting TIME_WAIT state for {self.remote_addr}. Connection fully closed.")
+        self.state = "CLOSED"
+        self._stop_connection_threads() # Now it's safe to stop the threads
