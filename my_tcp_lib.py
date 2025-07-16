@@ -104,7 +104,9 @@ class Connection:
         
         self.send_window_size = 65535
         self.receive_window_size = 65535
-        
+
+        #self.send_window_size = 16
+        #self.receive_window_size = 16
         # بسته‌های ارسال شده اما تایید نشده: {شماره_توالی: (بسته, زمان_ارسال)}
         self.unacked_sent_packets = {} 
         
@@ -127,13 +129,13 @@ class Connection:
         self.incoming_packet_queue = queue.Queue() 
         self.out_of_order_receive_buffer = {} # Stores out-of-order packets: {seq_num: (packet_data, original_packet_obj)}
 
+        self.SCENARIO_3_Packet_test = None
+
         # --- Scenario Flags Initialization ---
         scenario_flags = scenario_flags if scenario_flags is not None else {}
         self.SCENARIO_1_ACTIVE = scenario_flags.get('SCENARIO_1_ACTIVE', False)
-        self.SCENARIO_2_ACTIVE = scenario_flags.get('SCARIO_2_ACTIVE', False)
-        self.SCENARIO_3_ACTIVE = scenario_flags.get('SCENARIO_3_FAST_RETRANSMIT_ACTIVE', False)
-        self.SCENARIO_4_ACTIVE = scenario_flags.get('SCENARIO_4_REORDER_ACTIVE', False)
-        self.SCENARIO_5_ACTIVE = scenario_flags.get('SCENARIO_5_DUP_DATA_RECV_ACTIVE', False)
+        self.SCENARIO_2_ACTIVE = scenario_flags.get('SCENARIO_2_ACTIVE', False)
+        self.SCENARIO_3_ACTIVE = scenario_flags.get('SCENARIO_3_ACTIVE', False)
 
         self.packet_num = 0
         
@@ -183,7 +185,7 @@ class Connection:
             
             # تعیین طول داده برای ارسال در این مرحله (min از بافر، پنجره، MSS)
             send_data_length = min(len(self.send_buffer), available_window_space, MSS)
-            
+       
             if send_data_length > 0:
                 data_for_packet = self.send_buffer[:send_data_length] 
                 packet_seq_num_for_this_send = self.my_seq_num # شماره توالی فعلی برای بسته جدید
@@ -191,11 +193,17 @@ class Connection:
                 # --- شبیه‌سازی Loss بسته داده اولیه برای سناریو ۱ (ACK تجمیعی و Fast Retransmit) ---
                 # این شبیه‌سازی تلاش اولیه ارسال یک بسته را حذف می‌کند.
                 do_physical_send = True # پرچم کنترل ارسال فیزیکی در این تلاش
-                if self.SCENARIO_1_ACTIVE and \
+                x = 0 
+                if (self.SCENARIO_1_ACTIVE):
+                    x = 2
+                elif (self.SCENARIO_2_ACTIVE):
+                    x = 4
+
+                if (self.SCENARIO_1_ACTIVE or self.SCENARIO_2_ACTIVE) and \
                    self.scenario1_lost_packet_seq is None and \
-                   self.packet_num == 4 : # هدف قرار دادن اولین بسته داده پس از Handshake
+                   self.packet_num == x : # هدف قرار دادن اولین بسته داده پس از Handshake
                     
-                    log_event(f"SIMULATING LOSS (Scenario 1): Dropping actual UDP transmission for packet {self.packet_num} - Seq={packet_seq_num_for_this_send}.")
+                    log_event(f"SIMULATING LOSS (Scenario {x//2}): Dropping actual UDP transmission for packet {self.packet_num} - Seq={packet_seq_num_for_this_send}.")
                     self.scenario1_lost_packet_seq = packet_seq_num_for_this_send # علامت‌گذاری بسته به عنوان "یک بار از دست رفته"
                     self.SCENARIO_1_ACTIVE = False # اطمینان از اینکه فقط یک بار این حذف انجام شود.
                     do_physical_send = False # جلوگیری از فراخوانی udp_socket.sendto() در این تلاش
@@ -204,7 +212,9 @@ class Connection:
                 packet_to_send = Packet(self.udp_socket.getsockname()[1], self.remote_address[1], 
                                 packet_seq_num_for_this_send, self.next_expected_seq_from_peer, Packet.ACK, # ACK flag for data packets
                                 self.receive_window_size, data_for_packet)
-                
+                if self.SCENARIO_3_ACTIVE and self.packet_num == 10:
+                    self.SCENARIO_3_Packet_test = packet_to_send
+            
                 # اضافه کردن به بسته‌های تایید نشده و پیشروی شماره توالی
                 # این کار باید همیشه (در صورت ارسال مفهومی) انجام شود تا بسته در InFlight باشد و تایمرش شروع شود.
                 self.unacked_sent_packets[packet_to_send.seq_num] = (packet_to_send, time.time())
@@ -217,7 +227,10 @@ class Connection:
                     try:
                         self.udp_socket.sendto(packet_to_send.to_bytes(), self.remote_address)
                         log_event(f"Sent packet {self.packet_num} : Seq={packet_to_send.seq_num}, Len={len(data_for_packet)}, InFlight={bytes_in_flight + len(data_for_packet)}.")
-                        
+                        if self.SCENARIO_3_ACTIVE and self.packet_num == 20:
+                            self.udp_socket.sendto(self.SCENARIO_3_Packet_test.to_bytes(), self.remote_address)
+                            log_event(f"-------------SCENARIO_3 test-------------------:The packet number 10 retransmitted.")
+
                     except Exception as e:
                         log_event(f"Send error for Seq={packet_to_send.seq_num}: {e}.")
                 else: # اگر برای حذف علامت‌گذاری شده بود، فقط لاگ مربوطه را بزن.
@@ -253,13 +266,13 @@ class Connection:
                 # --- شبیه‌سازی Loss برای ACK در سناریو ۵ (دریافت داده تکراری) ---
                 # این شبیه‌سازی روی ACK های ورودی (در سمت کلاینت) اعمال می‌شود.
                 # مثال: گم کردن ACK برای بسته با شماره توالی اولیه + 5 * MSS + 1 (تقریباً بسته ششم داده)
-                if self.SCENARIO_5_ACTIVE and packet_received.is_ack() and \
+                if self.SCENARIO_2_ACTIVE and packet_received.is_ack() and \
                    self.scenario5_lost_ack_seq is None and \
                    packet_received.ack_num == (self.initial_seq_num + MSS * 5 + 1): 
                     
                     log_event(f"SIMULATING LOSS: Dropping ACK for Ack={packet_received.ack_num} for Scenario 5.")
                     self.scenario5_lost_ack_seq = packet_received.ack_num # علامت‌گذاری ACK از دست رفته
-                    self.SCENARIO_5_ACTIVE = False # اطمینان از اینکه فقط یک بار ACK حذف شود.
+                    self.SCENARIO_2_ACTIVE = False # اطمینان از اینکه فقط یک بار ACK حذف شود.
                     continue # از پردازش این ACK صرف‌نظر می‌کنیم
                 # --- پایان شبیه‌سازی ---
 
@@ -309,7 +322,7 @@ class Connection:
                 self.duplicate_ack_count = 0 # بازنشانی شمارنده ACK تکراری پس از دریافت ACK جدید
                 self.fast_retransmit_target_seq = None # پاک کردن هدف Fast Retransmit
 
-            else: # packet.ack_num <= self.last_acked_seq_by_me (این یک ACK تکراری است)
+            elif (packet.payload_length == 0): # packet.ack_num <= self.last_acked_seq_by_me (این یک ACK تکراری است)
                 log_event(f"Received duplicate ACK: Ack={packet.ack_num}, CurrentAcked={self.last_acked_seq_by_me}.")
                 self.duplicate_ack_count += 1
                 
@@ -393,8 +406,6 @@ class Connection:
                     log_event(f"Sent Duplicate ACK for old data: Ack={ack_packet.ack_num}, Window={ack_packet.window_size}.")
                 except Exception as e:
                     log_event(f"Error sending Duplicate ACK for old data: {e}.")
-
-            #time.sleep(2)
             
 
         # --- مدیریت فلگ FIN ---
@@ -431,11 +442,11 @@ class Connection:
 
 
     def send(self, data):
-        log_event(f"Application requested to send {len(data)} bytes to {self.remote_address}.")
+        #log_event(f"Application requested to send {len(data)} bytes to {self.remote_address}.")
         self.send_buffer += data
 
     def receive(self, buffer_size):
-        log_event(f"Application requested to receive {buffer_size} bytes from {self.remote_address}.")
+        #log_event(f"Application requested to receive {buffer_size} bytes from {self.remote_address}.")
         
         while len(self.receive_buffer) < buffer_size:
             if not self.is_running and len(self.receive_buffer) == 0:
@@ -446,7 +457,8 @@ class Connection:
         read_data = self.receive_buffer[:buffer_size]
         self.receive_buffer = self.receive_buffer[buffer_size:]
         
-        log_event(f"Application received {len(read_data)} bytes from {self.remote_address}.")
+        
+        #log_event(f"Application received {len(read_data)} bytes from {self.remote_address}.")
         return read_data
 
     def close(self):
@@ -507,7 +519,7 @@ class TCPSocket:
             try:
                 data, received_address = self.udp_socket.recvfrom(4096) 
                 received_packet = Packet.from_bytes(data)
-                log_event(f"Received UDP packet from {received_address}: {received_packet}")
+                #log_event(f"Received UDP packet from {received_address}: {received_packet}")
 
                 target_connection = None
                 if received_address in self.active_connections:
@@ -532,7 +544,7 @@ class TCPSocket:
                     else:
                         # For ALL other packets belonging to this active connection (data, FIN, RST, other ACKs)
                         # Pass them to the connection's handler via its internal queue.
-                        log_event(f"Queuing packet for connection {received_address}, state: {target_connection.state}. Packet: {received_packet}")
+                        #log_event(f"Queuing packet for connection {received_address}, state: {target_connection.state}. Packet: {received_packet}")
                         target_connection.incoming_packet_queue.put(received_packet) 
                 
                 elif received_packet.is_syn() and self.is_listening_socket: # New SYN request (only if listening as server)
@@ -589,11 +601,9 @@ class TCPSocket:
         
         # پرچم‌های سناریو برای Connection کلاینت
         client_scenario_flags = {
-            'SCENARIO_1_ACTIVE': True, # فعال کردن سناریو 1 (Loss بسته داده اولیه)
-            'SCENARIO_2_ACTIVE': False, # سناریو 2 (Loss و بازارسال با Timeout)
-            'SCENARIO_3_ACTIVE': True, # سناریو 3 (Fast Retransmit با 3 ACK تکراری)
-            'SCENARIO_4_ACTIVE': True, # سناریو 4 (ترتیب دریافت نادرست بسته ها) - با سناریو 1 ترکیب می‌شود
-            'SCENARIO_5_DUP_DATA_RECV_ACTIVE': True # سناریو 5 (دریافت داده تکراری به دلیل گم شدن ACK)
+            'SCENARIO_1_ACTIVE': False, #timeout retransmission for packet 2  and Acumulative ACK
+            'SCENARIO_2_ACTIVE': False, # Fast retransmit for packet 4
+            'SCENARIO_3_ACTIVE': True,
         }
         connection_obj = Connection(self.udp_socket, remote_address, scenario_flags=client_scenario_flags) 
         self.active_connections[remote_address] = connection_obj
