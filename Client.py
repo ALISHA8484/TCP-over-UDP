@@ -4,9 +4,12 @@ import os
 import struct
 import random
 
+"""
 from Packet import log_event, MSS , Packet
 from Connection import Connection
 from TCPSocket import TCPSocket
+"""
+from my_tcp_lib import log_event , TCPSocket ,MSS
 
 SERVER_HOST = '127.0.0.1'
 SERVER_PORT = 12345
