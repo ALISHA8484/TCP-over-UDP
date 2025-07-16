@@ -294,6 +294,14 @@ class Connection:
 
         # --- پردازش سگمنت ACK ---
         if packet.is_ack():
+            if self.state == "FIN_WAIT_1":
+                log_event(f"Received ACK in CLOSE_WAIT state from {self.remote_address}.Change State to FIN_WAIT_2.")
+                self.state = "FIN_WAIT_2"
+                return
+            elif self.state == "FIN_WAIT_2":
+                log_event(f"Received ACK in FIN_WAIT_2 state from {self.remote_address}.")
+                log_event(f"Connection Closed for {self.remote_address}.")
+                return
             # بررسی می‌کنیم که آیا این ACK، پنجره ارسال ما را پیش می‌برد (یعنی داده‌های جدیدی را تایید می‌کند).
             if packet.ack_num > self.last_acked_seq_by_me:
                 log_event(f"ACK received: Ack={packet.ack_num}, PrevAcked={self.last_acked_seq_by_me}. Moving send window.")
@@ -436,7 +444,7 @@ class Connection:
                     log_event(f"Error sending final ACK for FIN: {e}.")
                 threading.Timer(2 * self.retransmission_timeout, self._close_after_time_wait).start()
 
-        if self.state == "FIN_WAIT_1" and packet.is_ack() and packet.ack_num == (self.my_seq_num): # ACK for our FIN
+        if self.state == "FIN_WAIT_1":
             log_event(f"Received ACK for our FIN from {self.remote_address}. Moving to FIN_WAIT_2.")
             self.state = "FIN_WAIT_2"
 
@@ -475,6 +483,19 @@ class Connection:
                     self.my_seq_num += 1 
                 except Exception as e:
                     log_event(f"Error sending FIN: {e}.")
+            if self.state == "CLOSE_WAIT": 
+                self.state = "FIN_WAIT_2"
+                fin_packet = Packet(self.udp_socket.getsockname()[1], self.remote_address[1],
+                                    self.my_seq_num, self.next_expected_seq_from_peer, Packet.FIN,
+                                    self.receive_window_size)
+                try:
+                    self.udp_socket.sendto(fin_packet.to_bytes(), self.remote_address)
+                    log_event(f"Sent FIN to {self.remote_address}. Seq={fin_packet.seq_num}.")
+                    self.my_seq_num += 1 
+                except Exception as e:
+                    log_event(f"Error sending FIN: {e}.")
+
+
 
 
     def _close_after_time_wait(self):
@@ -603,7 +624,8 @@ class TCPSocket:
         client_scenario_flags = {
             'SCENARIO_1_ACTIVE': False, #timeout retransmission for packet 2  and Acumulative ACK
             'SCENARIO_2_ACTIVE': False, # Fast retransmit for packet 4
-            'SCENARIO_3_ACTIVE': True,
+            'SCENARIO_3_ACTIVE': False,
+            'SCENARIO_4_ACTIVE': False,
         }
         connection_obj = Connection(self.udp_socket, remote_address, scenario_flags=client_scenario_flags) 
         self.active_connections[remote_address] = connection_obj
@@ -637,7 +659,7 @@ class TCPSocket:
                     except queue.Empty:
                         pass # صف خالی است، ادامه انتظار
                 
-                if syn_ack_received_flag:
+                if syn_ack_received_flag and not client_scenario_flags["SCENARIO_4_ACTIVE"] :
                     connection_obj.peer_initial_seq_num = received_response_packet.seq_num
                     connection_obj.next_expected_seq_from_peer = received_response_packet.seq_num + 1 
                     
