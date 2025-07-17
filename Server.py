@@ -23,6 +23,8 @@ def run_server():
         log_event("Waiting for connections...")
         # accept() will block until a connection is established
         conn, addr = server_socket.accept() 
+        conn.is_server = True
+
         log_event(f"Connection established with {addr}")
 
         # Simulate receiving data from client
@@ -37,7 +39,7 @@ def run_server():
         
         while time.time() - start_time < receive_timeout:
             try:
-                # Try to read up to MSS bytes at a time [cite: 57]
+                # Try to read up to MSS bytes at a time
                 # conn.receive() will block if no data, or return b'' if connection closes cleanly
                 data = conn.receive(MSS) 
                 if data:
@@ -77,7 +79,10 @@ def run_server():
     except ConnectionRefusedError as e:
         log_event(f"Server connection error: {e}")
     except KeyboardInterrupt:
-        log_event("Server shutting down due to user interrupt.")
+        log_event("Server shutting down due to user interrupt (Ctrl+C).")
+        if server_socket:
+            server_socket._send_rst_to_all_clients() # Send RST to all active clients before closing
+ 
     except Exception as e:
         log_event(f"An unexpected error occurred in server: {e}")
     finally:

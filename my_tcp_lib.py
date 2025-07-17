@@ -11,7 +11,6 @@ MSS = 128 # بایت
 
 # --- تابع کمکی برای لاگ کردن رویدادها ---
 def log_event(message):
-    """رویدادها را با timestamp لاگ می‌کند."""
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     print(f"[{current_time}] {message}")
 
@@ -21,7 +20,7 @@ class Packet:
     ACK = 0x02
     FIN = 0x04
     RST = 0x08
-    # فرمت هدر بسته: پورت مبدا، پورت مقصد، شماره توالی، شماره تایید، فلگ‌ها، اندازه پنجره، طول پیلود
+
     HEADER_FORMAT = '!HHIIBHH' 
 
     def __init__(self, source_port, dest_port, seq_num, ack_num, flags, window_size=128, payload=b''):
@@ -82,6 +81,12 @@ class Packet:
 
 # --- کلاس Connection ---
 class Connection:
+    
+    @staticmethod
+    def _xor_cipher(data, key=b'SecretKey'):
+
+        return bytes([data[i] ^ key[i % len(key)] for i in range(len(data))])
+
     def __init__(self, udp_socket, remote_address, is_server=False, scenario_flags=None):
         self.udp_socket = udp_socket
         self.remote_address = remote_address
@@ -89,9 +94,10 @@ class Connection:
 
         self.state = "CLOSED"
         
-        # شماره توالی اولیه (Initial Sequence Number)
-        # برای آزمایش‌های ثابت، می‌توان آن را روی عدد ثابت (مثلاً 1) تنظیم کرد.
-        self.initial_seq_num = 1 
+
+        #self.initial_seq_num = random.randint(1,2**32 - 1)
+        self.initial_seq_num = 1
+
         self.my_seq_num = self.initial_seq_num
         self.last_acked_seq_by_me = self.initial_seq_num
 
@@ -101,24 +107,31 @@ class Connection:
 
         self.send_buffer = b"" 
         self.receive_buffer = b"" 
-        
-        self.send_window_size = 65535
-        self.receive_window_size = 65535
+        self.received_data = b""
 
-        #self.send_window_size = 16
-        #self.receive_window_size = 16
-        # بسته‌های ارسال شده اما تایید نشده: {شماره_توالی: (بسته, زمان_ارسال)}
+        self.estimated_rtt = 1.0  
+        self.dev_rtt = 0.1        
+        self.alpha = 0.125        
+        self.beta = 0.25          
+        self.sample_rtt = None 
+
+        
+        #self.send_window_size = 65535
+        #self.receive_window_size = 65535
+
+        self.send_window_size = 256
+        self.receive_window_size = 256
+
         self.unacked_sent_packets = {} 
         
-        # مقدار پنجره‌ای که مقصد تبلیغ کرده (Receive Window)
-        self.rwnd = self.receive_window_size 
-        # پنجره کنترل ازدحام (Congestion Window)
+        self.rwnd = self.receive_window_size #reciver window size
+
         self.cwnd = MSS 
-        # پنجره ارسال موثر (Effective Send Window): min(اندازه_پنجره_ارسال_برنامه, rwnd, cwnd)
+
         self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
         
-        self.duplicate_ack_count = 0 # شمارنده ACK تکراری
-        # شماره توالی بسته‌ای که برای Fast Retransmit هدف قرار گرفته است.
+        self.duplicate_ack_count = 0 
+
         self.fast_retransmit_target_seq = None 
 
         self.retransmission_timeout = 1.0 # (Retransmission Timeout (RTO
@@ -149,6 +162,9 @@ class Connection:
         self.receive_thread = threading.Thread(target=self._receive_loop) 
         self.is_running = False
 
+        self.RST_closing = False
+        self.is_server = False
+
     def _start_connection_threads(self):
         if not self.is_running:
             self.is_running = True
@@ -171,15 +187,9 @@ class Connection:
 
     def _send_loop(self):
         while self.is_running:
-            # محاسبه بایت‌های در پرواز
+
             bytes_in_flight = self.my_seq_num - self.last_acked_seq_by_me
 
-            # لاگ وضعیت فعلی حلقه ارسال
-            """
-            log_event(f"Send loop state: MySeq={self.my_seq_num}, Acked={self.last_acked_seq_by_me}, "
-                      f"InFlight={bytes_in_flight}, SendBufferLen={len(self.send_buffer)}, "
-                      f"Window={self.effective_send_window}")
-            """
 
             available_window_space = self.effective_send_window - bytes_in_flight
             
@@ -188,6 +198,8 @@ class Connection:
        
             if send_data_length > 0:
                 data_for_packet = self.send_buffer[:send_data_length] 
+
+                data_for_packet = self._xor_cipher (data_for_packet)
                 packet_seq_num_for_this_send = self.my_seq_num # شماره توالی فعلی برای بسته جدید
                 self.packet_num += 1
                 # --- شبیه‌سازی Loss بسته داده اولیه برای سناریو ۱ (ACK تجمیعی و Fast Retransmit) ---
@@ -225,6 +237,7 @@ class Connection:
 
                 if do_physical_send: # اگر برای حذف علامت‌گذاری نشده بود، ارسال فیزیکی کن.
                     try:
+                        self.packet_s = time.time()
                         self.udp_socket.sendto(packet_to_send.to_bytes(), self.remote_address)
                         log_event(f"Sent packet {self.packet_num} : Seq={packet_to_send.seq_num}, Len={len(data_for_packet)}, InFlight={bytes_in_flight + len(data_for_packet)}.")
                         if self.SCENARIO_3_ACTIVE and self.packet_num == 20:
@@ -248,6 +261,9 @@ class Connection:
                         self.unacked_sent_packets[seq] = (unacked_packet, current_time) # به‌روزرسانی زمان ارسال برای تلاش بازارسال بعدی
                         
                         self.cwnd = MSS # تنظیم مجدد CWND به MSS پس از Timeout
+                        self.estimated_rtt *= 2  # افزایش EstimatedRTT پس از Timeout
+                        self.estimated_rtt = min(self.estimated_rtt, 10.0)  # محدود کردن حداکثر مقدار
+                        log_event(f"Timeout occurred. New estimated_rtt={self.estimated_rtt:.3f}s")
                         log_event(f"CWND reset to {self.cwnd} due to timeout.")
                         self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
                         self.duplicate_ack_count = 0 # بازنشانی شمارنده ACK تکراری
@@ -261,20 +277,7 @@ class Connection:
     def _receive_loop(self):
         while self.is_running:
             try:
-                packet_received = self.incoming_packet_queue.get(timeout=0.1) # گرفتن بسته از صف (با تایم‌اوت)
-                
-                # --- شبیه‌سازی Loss برای ACK در سناریو ۵ (دریافت داده تکراری) ---
-                # این شبیه‌سازی روی ACK های ورودی (در سمت کلاینت) اعمال می‌شود.
-                # مثال: گم کردن ACK برای بسته با شماره توالی اولیه + 5 * MSS + 1 (تقریباً بسته ششم داده)
-                if self.SCENARIO_2_ACTIVE and packet_received.is_ack() and \
-                   self.scenario5_lost_ack_seq is None and \
-                   packet_received.ack_num == (self.initial_seq_num + MSS * 5 + 1): 
-                    
-                    log_event(f"SIMULATING LOSS: Dropping ACK for Ack={packet_received.ack_num} for Scenario 5.")
-                    self.scenario5_lost_ack_seq = packet_received.ack_num # علامت‌گذاری ACK از دست رفته
-                    self.SCENARIO_2_ACTIVE = False # اطمینان از اینکه فقط یک بار ACK حذف شود.
-                    continue # از پردازش این ACK صرف‌نظر می‌کنیم
-                # --- پایان شبیه‌سازی ---
+                packet_received = self.incoming_packet_queue.get(timeout=0.1)
 
                 self._handle_incoming_packet(packet_received) # پردازش بسته
                 time.sleep(0.02) # مکث کوتاه پس از پردازش هر بسته
@@ -288,8 +291,8 @@ class Connection:
 
         if packet.is_rst():
             log_event(f"Received RST from {self.remote_address}. Connection reset.")
-            self.state = "CLOSED"
-            self._stop_connection_threads()
+            if (not self.is_server):
+                threading.Timer(2 * self.retransmission_timeout, self._close_after_time_wait).start()
             return
 
         # --- پردازش سگمنت ACK ---
@@ -301,11 +304,12 @@ class Connection:
             elif self.state == "FIN_WAIT_2":
                 log_event(f"Received ACK in FIN_WAIT_2 state from {self.remote_address}.")
                 log_event(f"Connection Closed for {self.remote_address}.")
+                log_event(f"Decoded message from client: {self.received_data.decode('utf-8', errors='ignore')[:200]}...") # Show first 200 chars
+                self.received_data = b""
                 return
             # بررسی می‌کنیم که آیا این ACK، پنجره ارسال ما را پیش می‌برد (یعنی داده‌های جدیدی را تایید می‌کند).
             if packet.ack_num > self.last_acked_seq_by_me:
                 log_event(f"ACK received: Ack={packet.ack_num}, PrevAcked={self.last_acked_seq_by_me}. Moving send window.")
-                
                 newly_acked_bytes = packet.ack_num - self.last_acked_seq_by_me
                 
                 if newly_acked_bytes > 0:
@@ -322,7 +326,8 @@ class Connection:
                         keys_to_remove.append(seq_num)
                 for key in keys_to_remove:
                     del self.unacked_sent_packets[key]
-                
+                self._update_rtt_estimation(send_time)
+
                 self.cwnd += MSS # افزایش CWND بر اساس قانون کنترل ازدحام (افزایش خطی)
                 log_event(f"CWND increased to {self.cwnd} due to new ACK.")
                 self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
@@ -367,7 +372,8 @@ class Connection:
         # --- پردازش پیلود داده ---
         if packet.payload_length > 0:
             log_event(f"Processing data: Seq={packet.seq_num}, Expected={self.next_expected_seq_from_peer}, Len={packet.payload_length}.")
-            
+            packet.payload = self._xor_cipher(packet.payload)
+            self.received_data += packet.payload
             if packet.seq_num == self.next_expected_seq_from_peer:
                 self.receive_buffer += packet.payload
                 self.next_expected_seq_from_peer += packet.payload_length 
@@ -450,7 +456,6 @@ class Connection:
 
 
     def send(self, data):
-        #log_event(f"Application requested to send {len(data)} bytes to {self.remote_address}.")
         self.send_buffer += data
 
     def receive(self, buffer_size):
@@ -469,7 +474,25 @@ class Connection:
         #log_event(f"Application received {len(read_data)} bytes from {self.remote_address}.")
         return read_data
 
+    def _update_rtt_estimation(self, packet_send_time):
+        if packet_send_time is None:
+            return
+
+        self.sample_rtt = time.time() - packet_send_time
+
+        self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * self.sample_rtt
+        self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(self.sample_rtt - self.estimated_rtt)
+
+        self.retransmission_timeout = self.estimated_rtt + 4 * max(self.dev_rtt, 0.01) 
+    
+        self.retransmission_timeout = max(0.1, min(self.retransmission_timeout, 10.0))
+    
+        log_event(f"RTT Updated: Sample={self.sample_rtt:.3f}s, Est={self.estimated_rtt:.3f}s, Dev={self.dev_rtt:.3f}s, Timeout={self.retransmission_timeout:.3f}s")
+
     def close(self):
+        if self.RST_closing:
+            log_event(f"Connection with {self.remote_address} is closed with RST.")
+            return
         log_event(f"Initiating connection close for {self.remote_address}.")
         if self.state == "ESTABLISHED" or self.state == "CLOSE_WAIT": 
             if self.state == "ESTABLISHED": 
@@ -515,6 +538,7 @@ class TCPSocket:
         self.active_connections = {} # {remote_address: Connection_object}
         self.listening_thread = None
         self.is_running = False
+
 
     def bind(self, address):
         self.udp_socket.bind(address)
@@ -622,7 +646,7 @@ class TCPSocket:
         
         # پرچم‌های سناریو برای Connection کلاینت
         client_scenario_flags = {
-            'SCENARIO_1_ACTIVE': False, #timeout retransmission for packet 2  and Acumulative ACK
+            'SCENARIO_1_ACTIVE': True, #timeout retransmission for packet 2  and Acumulative ACK
             'SCENARIO_2_ACTIVE': False, # Fast retransmit for packet 4
             'SCENARIO_3_ACTIVE': False,
             'SCENARIO_4_ACTIVE': False,
@@ -688,6 +712,19 @@ class TCPSocket:
         log_event(f"Failed to connect to {remote_address} after {retries_count} retries. Connection aborted.")
         del self.active_connections[remote_address]
         raise ConnectionRefusedError(f"Could not connect to {remote_address}.")
+
+    def _send_rst_to_all_clients(self):
+        log_event("Sending RST to all connected clients due to abnormal shutdown.")
+        for conn in self.active_connections.values():
+            if conn.state == "ESTABLISHED":
+                try:
+                    conn.RST_closing = True
+                    rst_packet = Packet(self.udp_socket.getsockname()[1], conn.remote_address[1], 0, 0, Packet.RST)
+                    self.udp_socket.sendto(rst_packet.to_bytes(), conn.remote_address)
+                    log_event(f"Sent RST to {conn.remote_address} successfully.")
+                except Exception as e:
+                    log_event(f"Error sending RST to {conn.remote_address}: {e}")
+        self.close()
 
     def close(self): 
         log_event("Closing main socket.")
