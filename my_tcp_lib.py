@@ -111,11 +111,11 @@ class Connection:
         self.sample_rtt = None 
 
         
-        #self.send_window_size = 65535
-        #self.receive_window_size = 65535
+        self.send_window_size = 65535
+        self.receive_window_size = 65535
 
-        self.send_window_size = 256
-        self.receive_window_size = 256
+        #self.send_window_size = 256
+        #self.receive_window_size = 256
 
         self.unacked_sent_packets = {} 
         
@@ -310,12 +310,13 @@ class Connection:
                         keys_to_remove.append(seq_num)
                 for key in keys_to_remove:
                     del self.unacked_sent_packets[key]
+                
                 self._update_rtt_estimation(send_time)
 
                 self.cwnd += MSS
                 self.rwnd = packet.window_size
                 log_event(f"CWND increased to {self.cwnd} due to new ACK.")
-                #self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
+                self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
 
                 self.duplicate_ack_count = 0
                 self.fast_retransmit_target_seq = None
@@ -355,7 +356,7 @@ class Connection:
                         log_event("Fast Retransmit triggered but target packet not found or already retransmitted/acked.")
 
             self.rwnd = packet.window_size
-            #self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
+            self.effective_send_window = min(self.send_window_size, self.rwnd, self.cwnd)
 
         if packet.payload_length > 0:
             log_event(f"Processing data: Seq={packet.seq_num}, Expected={self.next_expected_seq_from_peer}, Len={packet.payload_length}.")

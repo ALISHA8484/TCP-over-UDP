@@ -2,15 +2,11 @@
 import sys
 import os
 import struct
-"""
-from Packet import log_event, MSS , Packet
-from Connection import Connection
-from TCPSocket import TCPSocket
-"""
+
 from my_tcp_lib import log_event , TCPSocket ,MSS
 
-SERVER_HOST = '127.0.0.1' # Listen on localhost
-SERVER_PORT = 12345       # Arbitrary port
+SERVER_HOST = '127.0.0.1'
+SERVER_PORT = 12345
 
 def run_server():
     server_socket = None
@@ -27,34 +23,33 @@ def run_server():
 
         log_event(f"Connection established with {addr}")
 
-        # Simulate receiving data from client
         received_data = b""
         total_received_bytes = 0
         
         log_event("Server receiving data...")
-        # Receive loop: receive data in chunks
+
         start_time = time.time()
         # Set a timeout for the server to wait for data (for robust testing)
         receive_timeout = 30 # seconds
         
         while time.time() - start_time < receive_timeout:
             try:
-                # Try to read up to MSS bytes at a time
+
                 # conn.receive() will block if no data, or return b'' if connection closes cleanly
                 data = conn.receive(MSS) 
                 if data:
                     received_data += data
                     total_received_bytes += len(data)
                     log_event(f"Server received {len(data)} bytes. Total: {total_received_bytes} bytes.")
+                    start_time = time.time()
                     # Check for end signal
-                    if b"end_of_transfer" in data: # It's better to check per-chunk or at the end
+                    if b"END_OF_CLIENT_DATA_STREAM" in data: # It's better to check per-chunk or at the end
                         log_event("Server received 'end_of_transfer' signal in data. Breaking receive loop.")
                         break
                 elif conn.state == "CLOSED": # Check if connection state indicates closure
                     log_event("Connection closed by peer during receive.")
                     break
                 else:
-                    # No data immediately available, sleep a bit to prevent busy-waiting
                     time.sleep(0.01) 
             except Exception as e:
                 log_event(f"Server receive error: {e}")
@@ -63,7 +58,6 @@ def run_server():
         log_event(f"Server finished receiving. Total bytes: {total_received_bytes}")
         log_event(f"Decoded message from client (may be truncated): {received_data.decode('utf-8', errors='ignore')[:200]}...") # Show first 200 chars
 
-        # Simulate sending a response
         response_message = b"Server says: Your data was received! Great job! " \
                            b"This is a longer response to test data transfer back. " \
                            b"Hopefully, it also segments correctly and gets ACKed. " \
