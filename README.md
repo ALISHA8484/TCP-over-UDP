@@ -4,6 +4,16 @@ This project is a Python-based implementation of a reliable transport protocol t
 
 The goal is to demonstrate a deep understanding of TCP's mechanisms by building them from scratch, including connection establishment, reliable data transfer, and connection termination.
 
+**Server Logs**
+
+<img width="2710" height="1091" alt="Server Logs" src="https://github.com/user-attachments/assets/f7de561e-50d9-47f1-919d-af2e0fa3a65b" />
+
+**Client Logs**
+
+<img width="2710" height="1091" alt="Client Logs" src="https://github.com/user-attachments/assets/80942d4a-aa83-46f5-9b55-3c1c62e7cd6b" />
+
+
+
 ---
 
 ## Features Implemented 📜
